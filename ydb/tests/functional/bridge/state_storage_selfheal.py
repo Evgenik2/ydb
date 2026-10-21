@@ -42,6 +42,7 @@ class BridgeStateStorageSelfHeal:
     nodes_per_pile = 12
     rings_count = 8
     replicas_per_ring = 1
+    expect_colocated = True
     step_seconds = 5
     relax_seconds = 30
     timeout = 300
@@ -101,10 +102,11 @@ class BridgeStateStorageSelfHeal:
                         group = groups(config, name, pile_id)[0]
                         assert len(group["Ring"]) == self.rings_count, group
                         assert all(len(ring["Node"]) == self.replicas_per_ring for ring in group["Ring"]), group
-                        assert placement(group) == expected, (name, group, expected)
+                        if self.expect_colocated:
+                            assert placement(group) == expected, (name, group, expected)
                 return config
 
-            self.initial = self.wait(ready, "healthy, colocated replicas on all three piles")
+            self.initial = self.wait(ready, "healthy state storage with configured placement on all three piles")
             self.bridge.create_data()
         except BaseException:
             self.bridge.teardown_method()

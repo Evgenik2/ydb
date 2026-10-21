@@ -12,6 +12,7 @@ TEST_SRCS(
     test_sdk_reconnect.py
     test_state_storage_selfheal.py
     test_state_storage_selfheal_piles.py
+    test_state_storage_selfheal_settings.py
 )
 
 SPLIT_FACTOR(24)
