@@ -5,6 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import requests
+from google.protobuf.json_format import ParseDict
+
+from ydb.core.protos import cms_pb2, msgbus_pb2
 
 from test_three_piles import TestBridgeThreePiles as BridgeThreePiles
 from ydb.tests.library.harness.util import LogLevels
@@ -104,11 +107,32 @@ class BridgeStateStorageSelfHeal:
                         assert placement(group) == expected, (name, group, expected)
                 return config
 
+            self.configure_sentinel()
             self.initial = self.wait(ready, "healthy, colocated replicas on all three piles")
             self.bridge.create_data()
         except BaseException:
             self.bridge.teardown_method()
             raise
+
+    def configure_sentinel(self):
+        def protobuf_names(config):
+            return {
+                "".join(part.capitalize() for part in key.split("_")): (
+                    protobuf_names(value) if isinstance(value, dict) else value
+                )
+                for key, value in config.items()
+            }
+
+        config = protobuf_names(self.bridge.cms_config)
+        # CMS may become active before its local YAML subscription is applied.
+        # Initialize the real Sentinel explicitly with the test configuration.
+        # Restart it so existing updater timers also use the shortened intervals.
+        for enabled in (False, True):
+            request = msgbus_pb2.TCmsRequest()
+            ParseDict(config, request.SetConfigRequest.Config)
+            request.SetConfigRequest.Config.SentinelConfig.Enable = enabled
+            response = self.bridge.cluster.client.send_request(request, "CmsRequest")
+            assert response.SetConfigResponse.Status.Code == cms_pb2.TStatus.OK, response
 
     def teardown_method(self):
         self.bridge.teardown_method()
