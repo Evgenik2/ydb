@@ -2,6 +2,7 @@ PY3TEST()
 
 TEST_SRCS(
     test_restarts.py
+    test_statestorage_replica_restart.py
 )
 
 SPLIT_FACTOR(10)

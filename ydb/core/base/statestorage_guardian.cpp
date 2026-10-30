@@ -27,6 +27,8 @@ struct TEvPrivate {
     enum EEv {
         EvRefreshFollowerState = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
         EvReplicaMissing,
+        EvReplicaRetry,
+        EvReplicaRecoveryTimeout,
 
         EvEnd
     };
@@ -48,6 +50,22 @@ struct TEvPrivate {
         explicit TEvReplicaMissing(bool missing)
             : Missing(missing)
         { }
+    };
+
+    struct TEvReplicaRetry : public TEventLocal<TEvReplicaRetry, EvReplicaRetry> {
+        const ui64 Cookie;
+
+        explicit TEvReplicaRetry(ui64 cookie)
+            : Cookie(cookie)
+        {}
+    };
+
+    struct TEvReplicaRecoveryTimeout : public TEventLocal<TEvReplicaRecoveryTimeout, EvReplicaRecoveryTimeout> {
+        const ui64 RecoveryId;
+
+        explicit TEvReplicaRecoveryTimeout(ui64 recoveryId)
+            : RecoveryId(recoveryId)
+        {}
     };
 };
 
@@ -189,6 +207,12 @@ class TReplicaGuardian : public TBaseGuardian<TReplicaGuardian> {
     TIntrusiveConstPtr<TGuardedInfo> Info;
 
     ui64 Signature;
+    enum class ERequest { None, Lookup, Update };
+    ERequest Request = ERequest::None;
+    ui32 UpdateStep = 0;
+    bool Recovering = false;
+    ui64 RecoveryId = 0;
+    TDuration RetryDelay = TDuration::MilliSeconds(250);
 
     friend class TBaseGuardian;
 
@@ -197,27 +221,91 @@ class TReplicaGuardian : public TBaseGuardian<TReplicaGuardian> {
     }
 
     void MakeRequest() {
-        ui64 cookie = ++LastCookie;
-        Send(Replica, new TEvStateStorage::TEvReplicaLookup(Info->TabletID, cookie, ClusterStateGeneration, ClusterStateGuid), IEventHandle::FlagTrackDelivery | IEventHandle::FlagSubscribeOnSession, cookie);
+        ++LastCookie;
+        Request = ERequest::Lookup;
+        RetryDelay = TDuration::MilliSeconds(250);
+        SendLookup();
         Become(&TThis::StateLookup);
+        ScheduleRetry();
     }
 
-    void UpdateInfo() {
-        ui64 cookie = ++LastCookie;
+    void SendLookup() {
+        Send(Replica, new TEvStateStorage::TEvReplicaLookup(Info->TabletID, LastCookie, ClusterStateGeneration,
+            ClusterStateGuid), IEventHandle::FlagTrackDelivery | IEventHandle::FlagSubscribeOnSession, LastCookie);
+    }
+
+    void UpdateInfo(ui32 step) {
+        ++LastCookie;
+        Request = ERequest::Update;
+        UpdateStep = step;
+        RetryDelay = TDuration::MilliSeconds(250);
+        SendUpdate();
+        Become(&TThis::StateUpdate);
+        ScheduleRetry();
+    }
+
+    void SendUpdate() {
         TAutoPtr<TEvStateStorage::TEvReplicaUpdate> req(new TEvStateStorage::TEvReplicaUpdate());
         req->Record.SetTabletID(Info->TabletID);
-        req->Record.SetCookie(cookie);
+        req->Record.SetCookie(LastCookie);
         req->Record.SetClusterStateGeneration(ClusterStateGeneration);
         req->Record.SetClusterStateGuid(ClusterStateGuid);
         ActorIdToProto(Info->Leader, req->Record.MutableProposedLeader());
         ActorIdToProto(Info->TabletLeader, req->Record.MutableProposedLeaderTablet());
         req->Record.SetProposedGeneration(Info->Generation);
-        req->Record.SetProposedStep(0);
+        req->Record.SetProposedStep(UpdateStep);
         req->Record.SetSignature(Signature);
         req->Record.SetIsGuardian(true);
 
-        Send(Replica, req.Release(), IEventHandle::FlagTrackDelivery | IEventHandle::FlagSubscribeOnSession, cookie);
-        Become(&TThis::StateUpdate);
+        Send(Replica, req.Release(), IEventHandle::FlagTrackDelivery | IEventHandle::FlagSubscribeOnSession, LastCookie);
+    }
+
+    void ScheduleRetry() {
+        if (Recovering) {
+            Schedule(RetryDelay, new TEvPrivate::TEvReplicaRetry(LastCookie));
+            RetryDelay = Min(RetryDelay * 2, TDuration::Seconds(2));
+        }
+    }
+
+    void Handle(TEvPrivate::TEvReplicaRetry::TPtr& ev) {
+        if (!Recovering || ev->Get()->Cookie != LastCookie || Request == ERequest::None) {
+            return;
+        }
+        // Retry the same logical request. A slow response must remain acceptable.
+        if (Request == ERequest::Lookup) {
+            SendLookup();
+        } else {
+            SendUpdate();
+        }
+        ScheduleRetry();
+    }
+
+    void Handle(TEvStateStorage::TEvReplicaShutdown::TPtr& ev) {
+        if (Signature && ev->Sender.LocalId() != Signature) {
+            return; // shutdown of a previous replica incarnation
+        }
+        if (!Recovering) {
+            Recovering = true;
+            Schedule(TDuration::Seconds(15), new TEvPrivate::TEvReplicaRecoveryTimeout(++RecoveryId));
+        }
+        ReplicaMissing(false);
+        MakeRequest();
+    }
+
+    void Handle(TEvPrivate::TEvReplicaRecoveryTimeout::TPtr& ev) {
+        if (Recovering && ev->Get()->RecoveryId == RecoveryId) {
+            Gone(); // permanent loss still goes through the parent's availability checks
+        }
+    }
+
+    void HandleUndelivered(TEvents::TEvUndelivered::TPtr& ev) {
+        if (!Recovering) {
+            TBaseGuardian::Handle(ev);
+        } else if (ev->Cookie == LastCookie) {
+            // The service may be absent while the actor is being replaced. Keep the
+            // tablet alive for the bounded recovery window, without extending it.
+            SomeSleep();
+        }
     }
 
     void Demoted() {
@@ -235,35 +323,42 @@ class TReplicaGuardian : public TBaseGuardian<TReplicaGuardian> {
         CheckConfigVersion(SelfId(), ev->Sender, ev->Get());
 
         const auto status = record.GetStatus();
+        Y_ABORT_UNLESS(status == NKikimrProto::OK || status == NKikimrProto::ERROR);
+        const ui32 gen = record.GetCurrentGeneration();
+        const TActorId leader = ActorIdFromProto(record.GetCurrentLeader());
+        const TActorId tabletLeader = ActorIdFromProto(record.GetCurrentLeaderTablet());
+        if (status == NKikimrProto::OK && (gen > Info->Generation
+                || (gen == Info->Generation && leader && (leader != Info->Leader
+                    || (tabletLeader && tabletLeader != Info->TabletLeader))))) {
+            return Demoted();
+        }
+        if (Request != ERequest::None && !record.GetCookie()) {
+            return; // an unsolicited notification cannot acknowledge a pending registration
+        }
+        const bool sameIncarnation = Signature == record.GetSignature();
         Signature = record.GetSignature();
         DowntimeFrom = TInstant::Max();
         ReplicaMissing(false);
 
-        if (status == NKikimrProto::OK) {
-            const ui32 gen = record.GetCurrentGeneration();
-
-            if (gen > Info->Generation) {
-                return Demoted();
-            } else if (gen == Info->Generation) {
-                const TActorId leader = ActorIdFromProto(record.GetCurrentLeader());
-                const TActorId tabletLeader = ActorIdFromProto(record.GetCurrentLeaderTablet());
-                if (!leader || leader == Info->Leader && !tabletLeader) {
-                    return UpdateInfo();
-                } else if (leader != Info->Leader || tabletLeader != Info->TabletLeader) {
-                    return Demoted(); // hack around cluster restarts
-                } else {
-                    Become(&TThis::StateCalm);
-                    Send(Guard, ev->Release().Release());
-                    return;
-                }
-            } else {
-                return UpdateInfo(); // what about locked-state?
-            }
-        } else if (status == NKikimrProto::ERROR) {
-            return UpdateInfo();
-        } else {
-            Y_ABORT();
+        const bool matches = status == NKikimrProto::OK && gen == Info->Generation
+            && leader == Info->Leader && tabletLeader == Info->TabletLeader;
+        if (!matches) {
+            return UpdateInfo(status == NKikimrProto::OK && gen == Info->Generation ? record.GetCurrentStep() : 0);
         }
+        if (Request == ERequest::Lookup || (Request == ERequest::Update
+                && (!sameIncarnation || record.GetCurrentStep() != UpdateStep))) {
+            // Even an already-correct record needs an IsGuardian update: otherwise
+            // the replica has no CurrentGuardian to notify when it shuts down.
+            return UpdateInfo(record.GetCurrentStep());
+        }
+        if (Request == ERequest::None && !sameIncarnation) {
+            return MakeRequest();
+        }
+        Request = ERequest::None;
+        Recovering = false;
+        ++RecoveryId; // invalidate the previous recovery deadline
+        Become(&TThis::StateCalm);
+        Send(Guard, ev->Release().Release());
     }
 
 public:
@@ -284,8 +379,10 @@ public:
     STATEFN(StateLookup) {
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvStateStorage::TEvReplicaInfo, Handle);
-            cFunc(TEvStateStorage::TEvReplicaShutdown::EventType, Gone);
-            hFunc(TEvents::TEvUndelivered, TBaseGuardian::Handle);
+            hFunc(TEvStateStorage::TEvReplicaShutdown, Handle);
+            hFunc(TEvents::TEvUndelivered, HandleUndelivered);
+            hFunc(TEvPrivate::TEvReplicaRetry, Handle);
+            hFunc(TEvPrivate::TEvReplicaRecoveryTimeout, Handle);
             hFunc(TEvInterconnect::TEvNodeDisconnected, HandleThenSomeSleep);
             cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
             hFunc(TEvStateStorage::TEvConfigVersionInfo, HandleConfigVersion);
@@ -295,8 +392,9 @@ public:
     STATEFN(StateCalm) { // info is correct, wait for disconnect event
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvStateStorage::TEvReplicaInfo, Handle);
-            cFunc(TEvStateStorage::TEvReplicaShutdown::EventType, Gone);
-            hFunc(TEvents::TEvUndelivered, TBaseGuardian::Handle);
+            hFunc(TEvStateStorage::TEvReplicaShutdown, Handle);
+            hFunc(TEvents::TEvUndelivered, HandleUndelivered);
+            hFunc(TEvPrivate::TEvReplicaRecoveryTimeout, Handle);
             hFunc(TEvInterconnect::TEvNodeDisconnected, HandleThenRequestInfo);
             cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
             hFunc(TEvStateStorage::TEvConfigVersionInfo, HandleConfigVersion);
@@ -305,7 +403,8 @@ public:
 
     STATEFN(StateSleep) { // not-connected, sleeping for retry
         switch (ev->GetTypeRewrite()) {
-            cFunc(TEvStateStorage::TEvReplicaShutdown::EventType, Gone);
+            hFunc(TEvStateStorage::TEvReplicaShutdown, Handle);
+            hFunc(TEvPrivate::TEvReplicaRecoveryTimeout, Handle);
             cFunc(TEvents::TEvWakeup::EventType, RequestInfo);
             cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
             hFunc(TEvStateStorage::TEvConfigVersionInfo, HandleConfigVersion);
@@ -315,8 +414,10 @@ public:
     STATEFN(StateUpdate) { // waiting for update result
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvStateStorage::TEvReplicaInfo, Handle);
-            cFunc(TEvStateStorage::TEvReplicaShutdown::EventType, Gone);
-            hFunc(TEvents::TEvUndelivered, TBaseGuardian::Handle);
+            hFunc(TEvStateStorage::TEvReplicaShutdown, Handle);
+            hFunc(TEvents::TEvUndelivered, HandleUndelivered);
+            hFunc(TEvPrivate::TEvReplicaRetry, Handle);
+            hFunc(TEvPrivate::TEvReplicaRecoveryTimeout, Handle);
             hFunc(TEvInterconnect::TEvNodeDisconnected, HandleThenSomeSleep);
             cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
             hFunc(TEvStateStorage::TEvConfigVersionInfo, HandleConfigVersion);

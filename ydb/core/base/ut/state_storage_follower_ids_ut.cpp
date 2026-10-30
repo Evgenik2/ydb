@@ -1040,8 +1040,11 @@ Y_UNIT_TEST_SUITE(TStateStorageFollowerIDsTest) {
             [](TEvStateStorage::TEvReplicaInfo::TPtr& ev) {
                 const auto msg = ev->Get();
 
-                if (msg->Record.FollowerSize() != 0) {
-                    UNIT_ASSERT(msg->Record.FollowerInfoSize() == msg->Record.FollowerSize());
+                // A guardian may forward the same event after it has already been
+                // converted to the legacy format by this observer.
+                if (msg->Record.FollowerInfoSize() != 0) {
+                    UNIT_ASSERT_VALUES_EQUAL(msg->Record.FollowerInfoSize(),
+                        msg->Record.FollowerSize() + msg->Record.FollowerCandidatesSize());
 
                     Cerr << "---- TEST ---- Received TEvInfo\n"
                         << msg->Record.DebugString()
@@ -1085,8 +1088,11 @@ Y_UNIT_TEST_SUITE(TStateStorageFollowerIDsTest) {
             [](TEvStateStorage::TEvReplicaInfo::TPtr& ev) {
                 const auto msg = ev->Get();
 
-                if (msg->Record.FollowerSize() != 0) {
-                    UNIT_ASSERT(msg->Record.FollowerInfoSize() == msg->Record.FollowerSize());
+                // A guardian may forward the same event after it has already been
+                // converted to the legacy format by this observer.
+                if (msg->Record.FollowerInfoSize() != 0) {
+                    UNIT_ASSERT_VALUES_EQUAL(msg->Record.FollowerInfoSize(),
+                        msg->Record.FollowerSize() + msg->Record.FollowerCandidatesSize());
 
                     Cerr << "---- TEST ---- Received TEvInfo\n"
                         << msg->Record.DebugString()
