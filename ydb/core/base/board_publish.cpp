@@ -39,8 +39,13 @@ class TBoardReplicaPublishActor : public TActorBootstrapped<TBoardReplicaPublish
     void NotAvailableUnsubscribe() {
         if (Replica.NodeId() != SelfId().NodeId())
             Send(TActivationContext::InterconnectProxy(Replica.NodeId()), new TEvents::TEvUnsubscribe());
-        Send(PublishActor, new TEvents::TEvGone());
-        PassAway();
+        NotAvailable();
+    }
+
+    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+        if (ev->Get()->SourceType == TEvStateStorage::TEvReplicaBoardPublish::EventType) {
+            NotAvailableUnsubscribe();
+        }
     }
 
 public:
@@ -59,11 +64,11 @@ public:
     {}
 
     void Bootstrap() {
-        // Note: we don't track delivery, and instead treat undelivery as some
-        // form of silent "permanent" failure, waiting for disconnection. On
-        // disconnection we assume the node may be restarted with a new
-        // configuration and the actor become valid.
-        Send(Replica, new TEvStateStorage::TEvReplicaBoardPublish(Path, Payload, 0, true, PublishActor, ClusterStateGeneration, ClusterStateGuid), IEventHandle::FlagSubscribeOnSession, ++Round);
+        // Interconnect may already be connected while the remote NodeWarden
+        // is still registering its board replicas. Retry undelivered publishes
+        // through the parent rather than waiting for a session disconnection.
+        Send(Replica, new TEvStateStorage::TEvReplicaBoardPublish(Path, Payload, 0, true, PublishActor, ClusterStateGeneration, ClusterStateGuid),
+            IEventHandle::FlagTrackDelivery | IEventHandle::FlagSubscribeOnSession, ++Round);
 
         Become(&TThis::StatePublish);
     }
@@ -73,6 +78,7 @@ public:
             cFunc(TEvents::TEvPoisonPill::EventType, Cleanup);
             cFunc(TEvInterconnect::TEvNodeDisconnected::EventType, NotAvailable); // no cleanup on node disconnect
             cFunc(TEvStateStorage::TEvReplicaShutdown::EventType, NotAvailableUnsubscribe);
+            hFunc(TEvents::TEvUndelivered, Handle);
         }
     }
 };

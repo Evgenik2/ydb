@@ -101,6 +101,8 @@ public:
     void KeepInfoFromOtherRingGroup();
     void IgnoreWriteOnlyRingGroupOnLookup();
     void ReturnNotAvailableWithoutReadableRingGroup();
+    void PublishAfterReplicaBecomesAvailable();
+    void RepublishAfterReplicaRestart();
 
 protected:
     THolder<TTestBasicRuntime> Context;
@@ -114,6 +116,8 @@ class TBoardSubscriberTest : public TBoardSubscriberTestBase {
     UNIT_TEST(NotAvailableByShutdown);
     UNIT_TEST(ReconnectReplica);
     UNIT_TEST(DropByDisconnect);
+    UNIT_TEST(PublishAfterReplicaBecomesAvailable);
+    UNIT_TEST(RepublishAfterReplicaRestart);
     UNIT_TEST_SUITE_END();
 };
 
@@ -175,6 +179,82 @@ UNIT_TEST_SUITE_REGISTRATION(TBoardSubscriber2DCTest);
 UNIT_TEST_SUITE_REGISTRATION(TBoardSubscriberTest);
 UNIT_TEST_SUITE_REGISTRATION(TBoardLookupWriteOnlyTest);
 UNIT_TEST_SUITE_REGISTRATION(TBoardLookupAllWriteOnlyTest);
+
+void TBoardSubscriberTestBase::PublishAfterReplicaBecomesAvailable() {
+    const auto replica = ResolveReplicas().front();
+    const ui32 replicaNodeIndex = replica.NodeId() - Context->GetNodeId();
+    const ui32 publisherNodeIndex = (replicaNodeIndex + 1) % Context->GetNodeCount();
+    const auto edge = Context->AllocateEdgeActor(publisherNodeIndex);
+
+    // Establish the session and subscribe to this replica before publishing.
+    // Only this replica can satisfy the assertion below.
+    Context->Send(replica, edge, new TEvStateStorage::TEvReplicaBoardLookup("path", true, 0, 0), publisherNodeIndex);
+    auto initial = Context->GrabEdgeEvent<TEvStateStorage::TEvReplicaBoardInfo>(edge);
+    UNIT_ASSERT(initial->Get()->Record.GetDropped());
+
+    bool failedPublish = false;
+    auto unavailable = Context->AddObserver<TEvStateStorage::TEvReplicaBoardPublish>([&](auto& ev) {
+        if (ev->Recipient != replica || failedPublish) {
+            return;
+        }
+        failedPublish = true;
+        // Model the actor system's response while this service ID has not yet
+        // been registered. Without delivery tracking this silently drops it.
+        TAutoPtr<IEventHandle> publish(ev.Release());
+        auto undelivered = IEventHandle::ForwardOnNondelivery(
+            std::move(publish), TEvents::TEvUndelivered::ReasonActorUnknown);
+        if (undelivered) {
+            Context->Send(undelivered, replicaNodeIndex, true);
+        }
+    });
+    const auto publisher = CreatePublisher("path", "test", edge, publisherNodeIndex);
+
+    auto update = Context->GrabEdgeEvent<TEvStateStorage::TEvReplicaBoardInfoUpdate>(edge, TDuration::Seconds(15));
+    UNIT_ASSERT(update);
+    UNIT_ASSERT(failedPublish);
+    UNIT_ASSERT_VALUES_EQUAL(update->Get()->Record.GetInfo().GetPayload(), "test");
+    UNIT_ASSERT_VALUES_EQUAL(ActorIdFromProto(update->Get()->Record.GetInfo().GetOwner()), publisher);
+    UNIT_ASSERT(!update->Get()->Record.GetInfo().GetDropped());
+}
+
+void TBoardSubscriberTestBase::RepublishAfterReplicaRestart() {
+    const auto replica = ResolveReplicas().front();
+    const ui32 replicaNodeIndex = replica.NodeId() - Context->GetNodeId();
+    const ui32 publisherNodeIndex = (replicaNodeIndex + 1) % Context->GetNodeCount();
+    const auto edge = Context->AllocateEdgeActor(publisherNodeIndex);
+    Context->Send(MakeStateStorageProxyID(), edge, new TEvStateStorage::TEvListBoard(), publisherNodeIndex);
+    auto config = Context->GrabEdgeEvent<TEvStateStorage::TEvListBoardResult>(edge);
+    auto info = MakeIntrusive<TStateStorageInfo>(*config->Get()->Info);
+
+    TActorId replicaActor = Context->GetLocalServiceId(replica, replicaNodeIndex);
+    size_t acks = 0;
+    auto ackObserver = Context->AddObserver<TEvStateStorage::TEvReplicaBoardPublishAck>([&](auto& ev) {
+        if (ev->Sender == replicaActor) {
+            ++acks;
+        }
+    });
+    const auto publisher = CreatePublisher("path", "test", edge, publisherNodeIndex);
+    Context->WaitFor("initial publication", [&] { return acks == 1; }, TDuration::Seconds(10));
+
+    bool shutdown = false;
+    auto shutdownObserver = Context->AddObserver<TEvStateStorage::TEvReplicaShutdown>([&](auto& ev) {
+        if (ev->Sender == replicaActor) {
+            shutdown = true;
+        }
+    });
+    Send(replica, edge, new TEvents::TEvPoisonPill(), publisherNodeIndex, true);
+    Context->WaitFor("replica shutdown notification", [&] { return shutdown; }, TDuration::Seconds(10));
+    replicaActor = Context->Register(CreateStateStorageBoardReplica(info, 0), replicaNodeIndex);
+    Context->RegisterService(replica, replicaActor, replicaNodeIndex);
+    acks = 0;
+    Context->WaitFor("publication on the replacement replica", [&] { return acks == 1; }, TDuration::Seconds(15));
+
+    Context->Send(replica, edge, new TEvStateStorage::TEvReplicaBoardLookup("path", false, 0, 0), publisherNodeIndex);
+    auto result = Context->GrabEdgeEvent<TEvStateStorage::TEvReplicaBoardInfo>(edge);
+    UNIT_ASSERT_VALUES_EQUAL(result->Get()->Record.InfoSize(), 1);
+    UNIT_ASSERT_VALUES_EQUAL(result->Get()->Record.GetInfo(0).GetPayload(), "test");
+    UNIT_ASSERT_VALUES_EQUAL(ActorIdFromProto(result->Get()->Record.GetInfo(0).GetOwner()), publisher);
+}
 
 void TBoardSubscriberTestBase::SimpleSubscriber() {
     const auto edgeSubscriber = Context->AllocateEdgeActor(0);
